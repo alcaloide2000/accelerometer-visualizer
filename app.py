@@ -179,7 +179,7 @@ Part files (`_part001`, `_part002`, …) are
 concatenated in order.
 """)
 
-tab_single, tab_compare = st.tabs(["🔬 Single Test", "📊 Compare Tests"])
+tab_single, tab_compare, tab_3accel, tab_overlay = st.tabs(["🔬 Single Test", "📊 Compare Tests", "📡 Compare 3 Accelerometers", "🎛️ Sensors per Test"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SINGLE TEST
@@ -263,6 +263,42 @@ with tab_single:
                     )
 
             st.plotly_chart(_style(fig, 720), use_container_width=True)
+
+            # ── combined overlay: all sensors on one FFT ──────────────────────
+            st.markdown("#### All Sensors — FFT Overlay")
+            fig_ov = go.Figure()
+            for i, ch in enumerate(channels):
+                color = SENSOR_COLORS[i % len(SENSOR_COLORS)]
+                frq   = np.array(ch["frq"])
+                amp   = np.array(ch["amp"])
+                unit  = ch["meta"].get("Unit for accelerometer", "g")
+
+                fig_ov.add_trace(go.Scatter(
+                    x=frq, y=amp, mode="lines",
+                    line=dict(color=color, width=1.0),
+                    name=ch["label"].upper(),
+                ))
+
+                pidx = _peaks(frq, amp, n_peaks)
+                for rank, idx in enumerate(pidx):
+                    f, a = float(frq[idx]), float(amp[idx])
+                    fig_ov.add_trace(go.Scatter(
+                        x=[f], y=[a], mode="markers+text",
+                        marker=dict(color=color, size=7),
+                        text=[f"{ch['label'].upper()} f{rank+1}={f:.2f} Hz"],
+                        textposition="top right",
+                        textfont=dict(size=8, color=color),
+                        showlegend=False,
+                    ))
+                    fig_ov.add_shape(
+                        type="line", x0=f, x1=f, y0=0, y1=a,
+                        line=dict(color=color, width=0.7, dash="dash"),
+                        opacity=0.4,
+                    )
+
+            fig_ov.update_xaxes(title_text="Frequency (Hz)")
+            fig_ov.update_yaxes(title_text=f"Amplitude ({unit})")
+            st.plotly_chart(_style(fig_ov, 450), use_container_width=True)
 
             # peak table
             st.markdown("#### Peak Frequencies")
@@ -381,6 +417,211 @@ with tab_compare:
             use_container_width=True,
         )
 
+        # ── mean frequency summary per accelerometer ──────────────────────────
+        st.markdown("#### Mean Peak Frequencies per Accelerometer")
+        mean_rows = []
+        for rank in range(n_peaks):
+            mean_row = {"Rank": f"f{rank+1}"}
+            for s_idx in range(n_sens):
+                sensor_label = sensors[s_idx].upper()
+                freqs = []
+                for test in tests:
+                    if s_idx < len(test["channels"]):
+                        ch   = test["channels"][s_idx]
+                        frq  = np.array(ch["frq"])
+                        amp  = np.array(ch["amp"])
+                        pidx = _peaks(frq, amp, n_peaks)
+                        if rank < len(pidx):
+                            freqs.append(frq[pidx[rank]])
+                mean_row[sensor_label] = (
+                    f"{np.mean(freqs):.3f} Hz" if freqs else "—"
+                )
+            mean_rows.append(mean_row)
+        st.dataframe(
+            pd.DataFrame(mean_rows).set_index("Rank"),
+            use_container_width=True,
+        )
+
     elif tests:
         st.info(f"Upload files for all {n_tests} tests to see the comparison "
                 f"({len(tests)}/{n_tests} loaded).")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPARE 3 ACCELEROMETERS  (all 3 sensors on one FFT plot, one test)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_3accel:
+    st.caption("Upload all .txt files for one test. All three accelerometers are shown on the same frequency plot.")
+
+    uploaded_3a = st.file_uploader(
+        "Drop files here", type=["txt"],
+        accept_multiple_files=True, key="three_accel",
+    )
+
+    if uploaded_3a:
+        file_data_3a = tuple((f.name, f.read()) for f in uploaded_3a)
+        channels_3a  = process_test(file_data_3a)
+
+        if not channels_3a:
+            st.error("No channels detected. Filenames must contain 'Acel_1', 'Acel_2', or 'Acel_3'.")
+        else:
+            # info strip
+            info_cols = st.columns(len(channels_3a))
+            for col, ch in zip(info_cols, channels_3a):
+                col.metric(
+                    ch["label"].upper(),
+                    f"{ch['n_samples']:,} samples",
+                    f"{ch['duration']:.0f} s  @  {ch['fs']:.0f} Hz",
+                )
+
+            fig_3a = go.Figure()
+            unit_3a = "g"
+
+            for i, ch in enumerate(channels_3a):
+                color   = SENSOR_COLORS[i % len(SENSOR_COLORS)]
+                frq     = np.array(ch["frq"])
+                amp     = np.array(ch["amp"])
+                unit_3a = ch["meta"].get("Unit for accelerometer", "g")
+
+                fig_3a.add_trace(go.Scatter(
+                    x=frq, y=amp, mode="lines",
+                    line=dict(color=color, width=1.2),
+                    name=ch["label"].upper(),
+                ))
+
+                pidx = _peaks(frq, amp, n_peaks)
+                for rank, idx in enumerate(pidx):
+                    f, a = float(frq[idx]), float(amp[idx])
+                    fig_3a.add_trace(go.Scatter(
+                        x=[f], y=[a], mode="markers+text",
+                        marker=dict(color=color, size=8),
+                        text=[f"{ch['label'].upper()} f{rank+1}={f:.2f} Hz"],
+                        textposition="top right",
+                        textfont=dict(size=9, color=color),
+                        showlegend=False,
+                    ))
+                    fig_3a.add_shape(
+                        type="line", x0=f, x1=f, y0=0, y1=a,
+                        line=dict(color=color, width=0.8, dash="dash"),
+                        opacity=0.4,
+                    )
+
+            fig_3a.update_xaxes(title_text="Frequency (Hz)")
+            fig_3a.update_yaxes(title_text=f"Amplitude ({unit_3a})")
+            fig_3a.update_layout(legend=dict(
+                orientation="h", yanchor="bottom", y=1.02,
+                xanchor="left", x=0,
+            ))
+            st.plotly_chart(_style(fig_3a, 520), use_container_width=True)
+
+            # peak table
+            st.markdown("#### Peak Frequencies")
+            rows_3a = []
+            for rank in range(n_peaks):
+                row = {"Rank": f"f{rank+1}"}
+                for ch in channels_3a:
+                    frq  = np.array(ch["frq"])
+                    amp  = np.array(ch["amp"])
+                    pidx = _peaks(frq, amp, n_peaks)
+                    row[ch["label"].upper()] = (
+                        f"{frq[pidx[rank]]:.3f} Hz" if rank < len(pidx) else "—"
+                    )
+                rows_3a.append(row)
+            st.dataframe(
+                pd.DataFrame(rows_3a).set_index("Rank"),
+                use_container_width=True,
+            )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SENSORS PER TEST  (all sensors overlaid, one plot per test)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_overlay:
+    n_tests_ov = st.radio(
+        "Number of tests", [1, 2, 3, 4],
+        horizontal=True, key="n_tests_ov",
+    )
+
+    st.caption("Upload all .txt files for each test. Each test produces one FFT plot with all sensors overlaid.")
+
+    upload_cols_ov = st.columns(n_tests_ov)
+    tests_ov = []
+
+    for i, col in enumerate(upload_cols_ov):
+        with col:
+            test_name = st.text_input(
+                "Test name", value=f"Test {i + 1}", key=f"ovname_{i}",
+            )
+            ups = st.file_uploader(
+                f"Files for {test_name}", type=["txt"],
+                accept_multiple_files=True, key=f"overlay_{i}",
+            )
+            if ups:
+                file_data = tuple((f.name, f.read()) for f in ups)
+                channels  = process_test(file_data)
+                if channels:
+                    tests_ov.append({"name": test_name, "channels": channels})
+                    st.success(
+                        f"✓ {len(channels)} ch · "
+                        f"{channels[0]['n_samples']:,} pts · "
+                        f"{channels[0]['duration']:.0f} s"
+                    )
+                else:
+                    st.error("No channels detected in these files.")
+
+    if tests_ov:
+        for test in tests_ov:
+            st.markdown(f"#### {test['name']}")
+            fig = go.Figure()
+
+            for i, ch in enumerate(test["channels"]):
+                color = SENSOR_COLORS[i % len(SENSOR_COLORS)]
+                frq   = np.array(ch["frq"])
+                amp   = np.array(ch["amp"])
+                unit  = ch["meta"].get("Unit for accelerometer", "g")
+
+                fig.add_trace(go.Scatter(
+                    x=frq, y=amp, mode="lines",
+                    line=dict(color=color, width=1.0),
+                    name=ch["label"].upper(),
+                ))
+
+                pidx = _peaks(frq, amp, n_peaks)
+                for rank, idx in enumerate(pidx):
+                    f, a = float(frq[idx]), float(amp[idx])
+                    fig.add_trace(go.Scatter(
+                        x=[f], y=[a], mode="markers+text",
+                        marker=dict(color=color, size=7),
+                        text=[f"{ch['label'].upper()} f{rank+1}={f:.2f} Hz"],
+                        textposition="top right",
+                        textfont=dict(size=8, color=color),
+                        showlegend=False,
+                        legendgroup=ch["label"],
+                    ))
+                    fig.add_shape(
+                        type="line", x0=f, x1=f, y0=0, y1=a,
+                        line=dict(color=color, width=0.7, dash="dash"),
+                        opacity=0.4,
+                    )
+
+            fig.update_xaxes(title_text="Frequency (Hz)")
+            fig.update_yaxes(title_text=f"Amplitude ({unit})")
+            st.plotly_chart(_style(fig, 450), use_container_width=True)
+
+        # combined peak table across all loaded tests
+        if len(tests_ov) > 1:
+            st.markdown("#### Peak Frequencies — All Tests")
+            rows = []
+            for rank in range(n_peaks):
+                row = {"Rank": f"f{rank+1}"}
+                for test in tests_ov:
+                    for ch in test["channels"]:
+                        frq  = np.array(ch["frq"])
+                        amp  = np.array(ch["amp"])
+                        pidx = _peaks(frq, amp, n_peaks)
+                        key  = f"{ch['label'].upper()} — {test['name']}"
+                        row[key] = (f"{frq[pidx[rank]]:.3f} Hz"
+                                    if rank < len(pidx) else "—")
+                rows.append(row)
+            st.dataframe(
+                pd.DataFrame(rows).set_index("Rank"),
+                use_container_width=True,
+            )
