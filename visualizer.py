@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks, welch
+from scipy.signal import windows, find_peaks, welch, butter, sosfiltfilt, hilbert
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -37,6 +37,9 @@ GRID_COL = "#2a2a4e"
 # how far (Hz) from an FFT peak to look for the matching PSD peak
 DAMP_NPERSEG   = 4096
 DAMP_SEARCH_HZ = 0.25
+# decay method: an event must peak at least this many times the median
+# envelope (ambient level) to count as an excitation
+DAMP_MIN_EXCITATION = 8.0
 
 
 # ── data helpers ──────────────────────────────────────────────────────────────
@@ -174,6 +177,108 @@ def peak_zeta(ch, rank):
         return "—"
     z = damping_ratio(ch["psd_f"], ch["psd_p"], ch["frq"][pidx[rank]])
     return f"{z:.2f} %" if z is not None else "—"
+
+
+def decay_damping(values, fs, f0, band=0.5, win_s=5.0, n_events=3):
+    """Free-decay damping (envelope / log-decrement method).
+
+    Band-pass the signal around f0, pick the n_events largest excitations
+    (envelope maxima at least 3 windows apart), and for each one fit a
+    least-squares line to ln(maxima) vs time over the following win_s
+    seconds.  zeta % = -slope / (2*pi*f0) * 100.  Events below
+    DAMP_MIN_EXCITATION x the median envelope are ignored, and fitting stops
+    early when the maxima fall to the ambient level (2x the median envelope)."""
+    lo, hi = max(f0 - band, 0.05), min(f0 + band, fs / 2 * 0.99)
+    sos = butter(4, [lo, hi], btype="band", fs=fs, output="sos")
+    y   = sosfiltfilt(sos, values - values.mean())
+    env = np.abs(hilbert(y))
+    floor = 2.0 * np.median(env)
+    n_win = int(win_s * fs)
+
+    pk, _ = find_peaks(env[: len(env) - n_win], distance=max(1, 3 * n_win))
+    pk = pk[env[pk] >= DAMP_MIN_EXCITATION * np.median(env)]   # real excitations only
+    pk = np.sort(pk[np.argsort(env[pk])[::-1]][:n_events])
+
+    events = []
+    for p0 in pk:
+        seg = y[p0 : p0 + n_win]
+        mx, _ = find_peaks(seg, distance=max(1, int(0.7 * fs / f0)))
+        mx = mx[seg[mx] > 0]
+        below = np.nonzero(seg[mx] < floor)[0]
+        if len(below):
+            mx = mx[: below[0]]
+        if len(mx) < 5:
+            continue
+        t_mx = (p0 + mx) / fs
+        ln_a = np.log(seg[mx])
+        slope, icpt = np.polyfit(t_mx, ln_a, 1)
+        r2 = float(np.corrcoef(t_mx, ln_a)[0, 1] ** 2)
+        ctx = int(1.0 * fs)                   # 1 s of context before the event
+        a, b = max(p0 - ctx, 0), min(p0 + n_win, len(y))
+        events.append(dict(
+            t0=p0 / fs, slope=slope, icpt=icpt, r2=r2,
+            zeta=-slope / (2 * np.pi * f0) * 100.0,
+            t_seg=np.arange(a, b) / fs, y_seg=y[a:b],
+            t_mx=t_mx, a_mx=seg[mx], include=True,
+        ))
+    return events
+
+
+DAMP_DEFAULTS = dict(band=0.5, win_s=5.0, n_events=3)
+
+
+def dominant_f0(channels):
+    """Median of each channel's dominant FFT peak — the default f0."""
+    dom = [ch["frq"][top_peaks(ch["frq"], ch["amp"], 1)[0]] for ch in channels]
+    return float(np.median(dom))
+
+
+def run_damping(channels, f0, band, win_s, n_events):
+    """decay_damping for every channel → [(sensor index, channel, event)]."""
+    rows = []
+    for s_idx, ch in enumerate(channels):
+        fs = float(ch["meta"].get("Sampling rate", "250") or "250")
+        for ev in decay_damping(ch["df"]["value"].to_numpy(), fs,
+                                f0, band, win_s, n_events):
+            rows.append((s_idx, ch, ev))
+    return rows
+
+
+def damping_means(channels, rows):
+    """Per-sensor mean zeta (a1, a2, a3 …) and overall mean of included events."""
+    per, all_z = [], []
+    for s_idx in range(len(channels)):
+        z = [ev["zeta"] for si, _, ev in rows if si == s_idx and ev["include"]]
+        all_z += z
+        per.append(float(np.mean(z)) if z else None)
+    return per, (float(np.mean(all_z)) if all_z else None)
+
+
+def plot_decay(ax_sig, ax_reg, ch, ev, f0, band, color):
+    """Filtered signal + envelope of maxima, and ln(envelope) regression."""
+    unit = ch["meta"].get("Unit for accelerometer", "g")
+    ax_sig.clear(); style_ax(ax_sig)
+    ax_sig.plot(ev["t_seg"], ev["y_seg"], color="#1e40af", linewidth=0.8,
+                label=f"filtered {f0:.2f} ± {band:g} Hz")
+    ax_sig.plot(ev["t_mx"], ev["a_mx"], color="red", linewidth=1.2,
+                label="envelope of maxima")
+    ax_sig.set_title(f"{ch['label'].upper()} — filtered around {f0:.2f} Hz",
+                     color=color, fontsize=10, fontweight="bold")
+    ax_sig.set_xlabel("Time (s)", fontsize=8)
+    ax_sig.set_ylabel(f"Acc ({unit})", fontsize=8)
+    ax_sig.legend(fontsize=7, loc="upper right")
+
+    ax_reg.clear(); style_ax(ax_reg)
+    ax_reg.plot(ev["t_mx"], np.log(ev["a_mx"]), "^", color="red",
+                markerfacecolor="none", label="ln(envelope)")
+    ax_reg.plot(ev["t_mx"], ev["slope"] * ev["t_mx"] + ev["icpt"],
+                color="blue", linewidth=1.0,
+                label=f"fit: m = {ev['slope']:.4f} 1/s,  R² = {ev['r2']:.2f}")
+    ax_reg.set_title(f"Linear regression of envelope — ζ = {ev['zeta']:.3f} %",
+                     color="#111111", fontsize=10, fontweight="bold")
+    ax_reg.set_xlabel("Time (s)", fontsize=8)
+    ax_reg.set_ylabel("ln(amplitude)", fontsize=8)
+    ax_reg.legend(fontsize=7, loc="upper right")
 
 
 def style_ax(ax):
@@ -776,10 +881,11 @@ class App(tk.Tk):
                      color="#111111", fontsize=9, pad=4)
 
 
-    # ── damping window ────────────────────────────────────────────────────────
+    # ── damping window (free-decay / envelope method) ─────────────────────────
     def _show_damping(self):
-        """Open a window listing ζ for every detected peak of the loaded
-        test(s); selecting a row plots its PSD with the half-power band."""
+        """Damping per accelerometer following the envelope method: band-pass
+        around f0, envelope of maxima after each excitation, least-squares
+        fit of ln(envelope) vs time, zeta = -slope / (2*pi*f0)."""
         mode = self.mode.get()
         if mode == "single":
             tests = [self.single_test] if self.single_test else []
@@ -791,95 +897,171 @@ class App(tk.Tk):
             messagebox.showinfo("Damping", "Load a test first.")
             return
 
-        n = self.n_peaks_var.get()
-        entries = []   # (test name, sensor index, channel, rank, f0, band)
-        for test in tests:
-            for s_idx, ch in enumerate(test["channels"]):
-                ch["pidx"] = top_peaks(ch["frq"], ch["amp"], n)
-                for rank, idx in enumerate(ch["pidx"]):
-                    f0   = ch["frq"][idx]
-                    band = half_power_band(ch["psd_f"], ch["psd_p"], f0)
-                    entries.append((test["name"], s_idx, ch, rank, f0, band))
-
         win = tk.Toplevel(self)
-        win.title("Damping — half-power bandwidth")
-        win.geometry("1000x780")
+        win.title("Damping — envelope decay method")
+        win.geometry("1250x860")
         win.configure(bg=BG_DARK)
 
-        tk.Label(win, bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9), justify="left",
-                 anchor="w", wraplength=960,
-                 text=("ζ = (f₂ − f₁) / (2·f₀), where f₁, f₂ are the half-power points of "
-                       f"a Welch PSD (Hann, {DAMP_NPERSEG}-sample segments). "
-                       "Values above ~8 % usually mean two close modes merged into one "
-                       "wide peak.  Select a row to see its band.")
-                 ).pack(fill="x", padx=10, pady=(8, 4))
+        # ── controls ────────────────────────────────────────────────────────
+        ctl = tk.Frame(win, bg=BG_DARK)
+        ctl.pack(fill="x", padx=10, pady=(8, 4))
 
-        cols = ("test", "sensor", "peak", "f0", "zeta", "f1", "f2", "bw")
-        heads = ("Test", "Sensor", "Peak", "f₀ (Hz)", "ζ (%)", "f₁ (Hz)", "f₂ (Hz)", "Δf (Hz)")
-        tree_frame = tk.Frame(win, bg=BG_DARK)
-        tree_frame.pack(fill="both", expand=False, padx=10)
-        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=12)
+        def lbl(text):
+            tk.Label(ctl, text=text, bg=BG_DARK, fg=FG_DIM,
+                     font=("Segoe UI", 9)).pack(side="left", padx=(8, 2))
+
+        test_var = tk.StringVar(value=tests[0]["name"])
+        f0_var   = tk.StringVar()
+        band_var = tk.DoubleVar(value=DAMP_DEFAULTS["band"])
+        win_var  = tk.DoubleVar(value=DAMP_DEFAULTS["win_s"])
+        nev_var  = tk.IntVar(value=DAMP_DEFAULTS["n_events"])
+
+        lbl("Test:")
+        test_cb = ttk.Combobox(ctl, textvariable=test_var, width=14, state="readonly",
+                               values=[t["name"] for t in tests])
+        test_cb.pack(side="left")
+        lbl("f₀ (Hz):")
+        f0_cb = ttk.Combobox(ctl, textvariable=f0_var, width=9)
+        f0_cb.pack(side="left")
+        lbl("Band ± (Hz):")
+        tk.Spinbox(ctl, from_=0.1, to=5, increment=0.1, textvariable=band_var,
+                   width=5).pack(side="left")
+        lbl("Decay window (s):")
+        tk.Spinbox(ctl, from_=1, to=30, increment=0.5, textvariable=win_var,
+                   width=5).pack(side="left")
+        lbl("Events / sensor:")
+        tk.Spinbox(ctl, from_=1, to=10, textvariable=nev_var, width=4).pack(side="left")
+
+        def test_by_name():
+            return next(t for t in tests if t["name"] == test_var.get())
+
+        def fill_f0_choices(_e=None):
+            test = test_by_name()
+            freqs = set()
+            for ch in test["channels"]:
+                pidx = top_peaks(ch["frq"], ch["amp"], self.n_peaks_var.get())
+                freqs.update(round(float(ch["frq"][i]), 2) for i in pidx)
+            f0_cb["values"] = [f"{f:.2f}" for f in sorted(freqs)]
+            f0_var.set(f"{dominant_f0(test['channels']):.2f}")
+
+        test_cb.bind("<<ComboboxSelected>>", lambda e: (fill_f0_choices(), calculate()))
+        fill_f0_choices()
+
+        for text, cmd, bg in (("Calculate",              lambda: calculate(),      "#9a3412"),
+                              ("Include / exclude row",  lambda: toggle_row(),     "#374151"),
+                              ("Copy table",             lambda: copy_table(),     "#0369a1")):
+            tk.Button(ctl, text=text, command=cmd, bg=bg, fg="white", relief="flat",
+                      padx=10, pady=3, font=("Segoe UI", 9, "bold"),
+                      cursor="hand2").pack(side="left", padx=(8, 0))
+
+        # ── results table + summary ─────────────────────────────────────────
+        mid = tk.Frame(win, bg=BG_DARK)
+        mid.pack(fill="x", padx=10)
+        cols  = ("test", "chan", "t0", "units", "slope", "f0", "zeta", "r2", "use")
+        heads = ("Test", "Channel", "Event t (s)", "Units", "Slope m (1/s)",
+                 "f₀ (Hz)", "Damping ratio %", "R²", "Used")
+        tree = ttk.Treeview(mid, columns=cols, show="headings", height=9)
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
-            tree.column(c, width=110, anchor="center")
-        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+            tree.column(c, width=120, anchor="center")
+        tree.tag_configure("off", foreground="#aaaaaa")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
-        tree.pack(side="left", fill="both", expand=True)
+        tree.pack(side="left", fill="x", expand=True)
         sb.pack(side="right", fill="y")
 
-        for k, (tname, s_idx, ch, rank, f0, band) in enumerate(entries):
-            if band is None:
-                vals = ("—", "—", "—", "—")
-            else:
-                _, f1, f2 = band
-                vals = (f"{100 * (f2 - f1) / (2 * f0):.2f}",
-                        f"{f1:.3f}", f"{f2:.3f}", f"{f2 - f1:.3f}")
-            tree.insert("", "end", iid=str(k),
-                        values=(tname, ch["label"].upper(), f"f{rank + 1}",
-                                f"{f0:.3f}") + vals)
+        summary = tk.Label(win, bg=BG_PANEL, fg=FG_MAIN, anchor="w",
+                           font=("Segoe UI", 10, "bold"), padx=10, pady=4)
+        summary.pack(fill="x", padx=10, pady=(4, 0))
 
-        fig = plt.figure(figsize=(9, 3.6), facecolor="white")
-        ax  = fig.add_subplot(111)
+        # ── plots: filtered signal + envelope, ln(envelope) regression ──────
+        fig = plt.figure(figsize=(11, 4.2), facecolor="white")
+        ax_sig = fig.add_subplot(121)
+        ax_reg = fig.add_subplot(122)
         canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=8)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=6)
+        NavigationToolbar2Tk(canvas, win)
         win.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig), win.destroy()))
 
-        def on_select(_event=None):
+        rows = []    # (sensor index, channel, event dict)
+        state = {"f0": None}
+
+        def row_values(k):
+            s_idx, ch, ev = rows[k]
+            return (test_var.get(), ch["label"].upper(), f"{ev['t0']:.1f}",
+                    ch["meta"].get("Unit for accelerometer", "g"),
+                    f"{ev['slope']:.4f}", f"{state['f0']:.2f}",
+                    f"{ev['zeta']:.3f}", f"{ev['r2']:.2f}",
+                    "yes" if ev["include"] else "no")
+
+        def update_summary():
+            chans = test_by_name()["channels"]
+            per, overall = damping_means(chans, rows)
+            parts = [f"a{s_idx + 1} ({ch['label'].upper()}) = "
+                     + (f"{z:.3f} %" if z is not None else "—")
+                     for s_idx, (ch, z) in enumerate(zip(chans, per))]
+            mean = f"{overall:.3f} %" if overall is not None else "—"
+            summary.config(text="Damping ratio %:   " + "     ".join(parts)
+                                + f"          Promedio = {mean}")
+
+        def calculate():
+            try:
+                f0   = float(f0_var.get())
+                band = float(band_var.get())
+                wsec = float(win_var.get())
+                nev  = int(nev_var.get())
+            except (tk.TclError, ValueError):
+                messagebox.showerror("Damping", "Invalid parameter value.", parent=win)
+                return
+            if band >= f0:
+                messagebox.showerror("Damping", "Band must be smaller than f₀.", parent=win)
+                return
+            state["f0"] = f0
+            test = test_by_name()
+            rows[:] = run_damping(test["channels"], f0, band, wsec, nev)
+            # remembered on the test so the Word report uses these results
+            test["damping"] = dict(f0=f0, band=band, win_s=wsec, n_events=nev,
+                                   rows=rows, reviewed=True)
+            tree.delete(*tree.get_children())
+            for k in range(len(rows)):
+                tree.insert("", "end", iid=str(k), values=row_values(k))
+            update_summary()
+            if rows:
+                tree.selection_set("0")
+            else:
+                ax_sig.clear(); ax_reg.clear()
+                ax_sig.set_title("No decays found — try another f₀ or a wider band",
+                                 fontsize=9)
+                canvas.draw()
+
+        def toggle_row():
+            for iid in tree.selection():
+                ev = rows[int(iid)][2]
+                ev["include"] = not ev["include"]
+                tree.item(iid, values=row_values(int(iid)),
+                          tags=() if ev["include"] else ("off",))
+            update_summary()
+
+        def copy_table():
+            lines = ["\t".join(heads)]
+            lines += ["\t".join(row_values(k)) for k in range(len(rows))]
+            lines.append(summary.cget("text"))
+            win.clipboard_clear()
+            win.clipboard_append("\n".join(lines))
+
+        def on_select(_e=None):
             sel = tree.selection()
             if not sel:
                 return
-            tname, s_idx, ch, rank, f0, band = entries[int(sel[0])]
-            color = SENSOR_COLORS[s_idx % len(SENSOR_COLORS)]
-            psd_f, psd_p = ch["psd_f"], ch["psd_p"]
-            m = (psd_f >= f0 - 2) & (psd_f <= f0 + 2)
-            ax.clear(); style_ax(ax)
-            ax.plot(psd_f[m], psd_p[m], color=color, linewidth=1.2)
-            ax.axvline(f0, color="#444444", linewidth=0.8, linestyle=":",
-                       label=f"FFT peak f₀ = {f0:.3f} Hz")
-            if band is not None:
-                i, f1, f2 = band
-                zeta = 100 * (f2 - f1) / (2 * f0)
-                ax.axhline(psd_p[i] / 2, color="#9a3412", linewidth=0.8,
-                           linestyle="--", label="half power")
-                ax.axvspan(f1, f2, color="#9a3412", alpha=0.15,
-                           label=f"f₁–f₂ = {f1:.3f}–{f2:.3f} Hz")
-                ax.plot(psd_f[i], psd_p[i], "o", color=color, markersize=5)
-                title = f"ζ = {zeta:.2f} %"
-            else:
-                title = "ζ not resolvable (band too narrow or runs off the search range)"
-            unit = ch["meta"].get("Unit for accelerometer", "g")
-            ax.set_title(f"{tname} · {ch['label'].upper()} · f{rank + 1}  —  {title}",
-                         color="#111111", fontsize=10, fontweight="bold")
-            ax.set_xlabel("Frequency (Hz)", color="#444444", fontsize=8)
-            ax.set_ylabel(f"PSD ({unit}²/Hz)", color="#444444", fontsize=8)
-            ax.legend(fontsize=8, loc="upper right")
+            s_idx, ch, ev = rows[int(sel[0])]
+            test = test_by_name()
+            plot_decay(ax_sig, ax_reg, ch, ev, state["f0"], test["damping"]["band"],
+                       SENSOR_COLORS[s_idx % len(SENSOR_COLORS)])
             fig.tight_layout()
             canvas.draw()
 
         tree.bind("<<TreeviewSelect>>", on_select)
-        if entries:
-            tree.selection_set("0")
-            on_select()
+        calculate()
 
     # ── report generation ─────────────────────────────────────────────────────
     # ── hover tooltips ────────────────────────────────────────────────────────
@@ -996,6 +1178,110 @@ class App(tk.Tk):
                     facecolor=fig.get_facecolor())
         buf.seek(0)
         return buf
+
+    @staticmethod
+    def _shade(cell, fill):
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), fill)
+        shd.set(qn("w:val"),  "clear")
+        cell._tc.get_or_add_tcPr().append(shd)
+
+    def _simple_table(self, doc, headers, rows):
+        """Blue-header table with alternating row fill, like the peak tables."""
+        tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
+        tbl.style = "Table Grid"
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for j, h in enumerate(headers):
+            cell = tbl.rows[0].cells[j]
+            cell.text = h
+            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = cell.paragraphs[0].runs[0]
+            run.font.bold = True
+            run.font.color.rgb = RGBColor(0xff, 0xff, 0xff)
+            self._shade(cell, "1e3a8a")
+        for i, row in enumerate(rows, 1):
+            fill = "e8f4fd" if i % 2 else "ffffff"
+            for j, text in enumerate(row):
+                cell = tbl.rows[i].cells[j]
+                cell.text = text
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                self._shade(cell, fill)
+        return tbl
+
+    def _add_damping_section(self, doc, tests):
+        """Damping table in the layout of damping_amortiguamiento_guide:
+        per-event rows, then a1/a2/a3 per-sensor means and the overall mean."""
+        doc.add_paragraph()
+        self._heading(doc, "Damping — Envelope Decay Method", level=2)
+        doc.add_paragraph(
+            "For each accelerometer the largest excitations are selected, the signal "
+            "is band-pass filtered around the frequency of interest f₀ and the "
+            "envelope of maxima is taken over the following seconds. The envelope is "
+            "plotted on a logarithmic scale against time, a least-squares line is "
+            "fitted, and the fraction of critical damping is ζ = −m / (2π·f₀) · 100 %, "
+            "where m is the slope of the fit.")
+
+        summary = []
+        for test in tests:
+            chans = test["channels"]
+            d = test.get("damping")
+            if d is None:
+                f0 = dominant_f0(chans)
+                d = dict(f0=f0, rows=run_damping(chans, f0, **DAMP_DEFAULTS),
+                         reviewed=False, **DAMP_DEFAULTS)
+            used = [(si, ch, ev) for si, ch, ev in d["rows"] if ev["include"]]
+            n_off = len(d["rows"]) - len(used)
+
+            if len(tests) > 1:
+                self._heading(doc, test["name"], level=3)
+            note = (f"f₀ = {d['f0']:.2f} Hz, band ± {d['band']:g} Hz, decay window "
+                    f"{d['win_s']:g} s, up to {d['n_events']} events per sensor.")
+            if n_off:
+                note += f" {n_off} event(s) excluded after review."
+            if not d["reviewed"]:
+                note += " Default parameters — not reviewed in the Damping window."
+            doc.add_paragraph(note)
+
+            if not used:
+                doc.add_paragraph("No decays found.")
+            else:
+                self._simple_table(
+                    doc,
+                    ["TestName", "ChanTitle", "Units", "SlopeM", "Omega0",
+                     "DampingRatio%", "R²"],
+                    [[test["name"], ch["label"].upper(),
+                      ch["meta"].get("Unit for accelerometer", "g"),
+                      f"{ev['slope']:.4f}", f"{d['f0']:.2f}",
+                      f"{ev['zeta']:.3f}", f"{ev['r2']:.2f}"]
+                     for _, ch, ev in used])
+
+                # example plots: the best-fitting event, as in the guide
+                si, ch, ev = max(used, key=lambda r: r[2]["r2"])
+                fig = plt.figure(figsize=(11, 4), facecolor="white")
+                plot_decay(fig.add_subplot(121), fig.add_subplot(122), ch, ev,
+                           d["f0"], d["band"], SENSOR_COLORS[si % len(SENSOR_COLORS)])
+                fig.tight_layout()
+                doc.add_paragraph()
+                doc.add_picture(self._fig_to_buf(fig), width=Inches(6.3))
+                plt.close(fig)
+                doc.add_paragraph(f"Best-fitting event: {ch['label'].upper()} "
+                                  f"at t = {ev['t0']:.1f} s (R² = {ev['r2']:.2f}).")
+
+            per, overall = damping_means(chans, d["rows"])
+            summary.append((test["name"], per, overall))
+
+        n_sens = max(len(per) for _, per, _ in summary)
+        labels = [ch["label"].upper() for ch in tests[0]["channels"]]
+        fmt = lambda z: f"{z:.3f}" if z is not None else "—"
+        self._heading(doc, "Damping ratio % — mean per accelerometer", level=3)
+        self._simple_table(
+            doc,
+            ["Test"] + [f"a{i + 1} ({labels[i]})" if i < len(labels) else f"a{i + 1}"
+                        for i in range(n_sens)] + ["Promedio"],
+            [[name] + [fmt(per[i]) if i < len(per) else "—" for i in range(n_sens)]
+             + [fmt(overall)] for name, per, overall in summary])
 
     @staticmethod
     def _add_peak_table(doc, channels, n_peaks):
@@ -1147,6 +1433,7 @@ class App(tk.Tk):
         self._heading(doc, "Identified Natural Frequencies", level=2)
         self._add_peak_table(doc, test["channels"], n)
 
+        self._add_damping_section(doc, [test])
         doc.save(path)
 
     # ── compare report ────────────────────────────────────────────────────────
@@ -1254,6 +1541,7 @@ class App(tk.Tk):
 
             doc.add_paragraph()
 
+        self._add_damping_section(doc, tests)
         doc.save(path)
 
     # ── overlay report (Compare 3 Accelerometers) ─────────────────────────────
@@ -1339,6 +1627,7 @@ class App(tk.Tk):
         self._heading(doc, "Identified Natural Frequencies", level=2)
         self._add_peak_table(doc, channels, n)
 
+        self._add_damping_section(doc, [test])
         doc.save(path)
 
 
