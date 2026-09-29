@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks, welch
+from scipy.signal import windows, find_peaks, welch, butter, sosfiltfilt, hilbert
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -17,6 +17,9 @@ GRID_COL      = "rgba(60,60,100,0.5)"
 # how far (Hz) from an FFT peak to look for the matching PSD peak
 DAMP_NPERSEG   = 4096
 DAMP_SEARCH_HZ = 0.25
+# decay method: an event must peak at least this many times the median
+# envelope (ambient level) to count as an excitation
+DAMP_MIN_EXCITATION = 8.0
 
 
 # ── data processing ───────────────────────────────────────────────────────────
@@ -171,6 +174,69 @@ def _peak_cells(ch, n):
     return out
 
 
+def _decay_damping(values, fs, f0, band=0.5, win_s=5.0, n_events=3):
+    """Free-decay damping (envelope / log-decrement method).
+
+    Band-pass the signal around f0, pick the n_events largest excitations
+    (envelope maxima at least 3 windows apart), and for each one fit a
+    least-squares line to ln(maxima) vs time over the following win_s
+    seconds.  zeta % = -slope / (2*pi*f0) * 100.  Events below
+    DAMP_MIN_EXCITATION x the median envelope are ignored, and fitting stops
+    early when the maxima fall to the ambient level (2x the median envelope)."""
+    lo, hi = max(f0 - band, 0.05), min(f0 + band, fs / 2 * 0.99)
+    sos = butter(4, [lo, hi], btype="band", fs=fs, output="sos")
+    y   = sosfiltfilt(sos, values - values.mean())
+    env = np.abs(hilbert(y))
+    floor = 2.0 * np.median(env)
+    n_win = int(win_s * fs)
+
+    pk, _ = find_peaks(env[: len(env) - n_win], distance=max(1, 3 * n_win))
+    pk = pk[env[pk] >= DAMP_MIN_EXCITATION * np.median(env)]   # real excitations only
+    pk = np.sort(pk[np.argsort(env[pk])[::-1]][:n_events])
+
+    events = []
+    for p0 in pk:
+        seg = y[p0 : p0 + n_win]
+        mx, _ = find_peaks(seg, distance=max(1, int(0.7 * fs / f0)))
+        mx = mx[seg[mx] > 0]
+        below = np.nonzero(seg[mx] < floor)[0]
+        if len(below):
+            mx = mx[: below[0]]
+        if len(mx) < 5:
+            continue
+        t_mx = (p0 + mx) / fs
+        ln_a = np.log(seg[mx])
+        slope, icpt = np.polyfit(t_mx, ln_a, 1)
+        r2 = float(np.corrcoef(t_mx, ln_a)[0, 1] ** 2)
+        ctx = int(1.0 * fs)                   # 1 s of context before the event
+        a, b = max(p0 - ctx, 0), min(p0 + n_win, len(y))
+        events.append(dict(
+            t0=p0 / fs, slope=slope, icpt=icpt, r2=r2,
+            zeta=-slope / (2 * np.pi * f0) * 100.0,
+            t_seg=np.arange(a, b) / fs, y_seg=y[a:b],
+            t_mx=t_mx, a_mx=seg[mx],
+        ))
+    return events
+
+
+def _dominant_f0(channels):
+    """Median of each channel's dominant FFT peak — the default f0."""
+    dom = [np.array(ch["frq"])[_peaks(ch["frq"], ch["amp"], 1)[0]] for ch in channels]
+    return float(np.median(dom))
+
+
+@st.cache_data(show_spinner="Computing damping…")
+def run_damping(file_data, f0, band, win_s, n_events):
+    """_decay_damping for every channel of a test → flat list of event dicts."""
+    rows = []
+    for s_idx, ch in enumerate(process_test(file_data)):
+        for ev in _decay_damping(np.array(ch["values"]), ch["fs"],
+                                 f0, band, win_s, n_events):
+            rows.append(dict(ev, s_idx=s_idx, label=ch["label"],
+                             unit=ch["meta"].get("Unit for accelerometer", "g")))
+    return rows
+
+
 def _ds(arr, mx):
     arr = np.array(arr)
     if len(arr) <= mx:
@@ -231,7 +297,7 @@ Part files (`_part001`, `_part002`, …) are
 concatenated in order.
 """)
 
-tab_single, tab_compare, tab_3accel, tab_overlay = st.tabs(["🔬 Single Test", "📊 Compare Tests", "📡 Compare 3 Accelerometers", "🎛️ Sensors per Test"])
+tab_single, tab_compare, tab_3accel, tab_overlay, tab_damp = st.tabs(["🔬 Single Test", "📊 Compare Tests", "📡 Compare 3 Accelerometers", "🎛️ Sensors per Test", "〰 Damping"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SINGLE TEST
@@ -674,3 +740,144 @@ with tab_overlay:
                 pd.DataFrame(rows).set_index("Rank"),
                 use_container_width=True,
             )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DAMPING  (free-decay envelope method, one test)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_damp:
+    st.caption(
+        "Upload all .txt files for one test. For each accelerometer the largest "
+        "excitations are band-pass filtered around f₀, the envelope of maxima is "
+        "fitted on a log scale, and ζ = −m / (2π·f₀) · 100 %, where m is the slope."
+    )
+
+    uploaded_d = st.file_uploader(
+        "Drop files here", type=["txt"],
+        accept_multiple_files=True, key="damping",
+    )
+
+    if uploaded_d:
+        file_data_d = tuple((f.name, f.read()) for f in uploaded_d)
+        channels_d  = process_test(file_data_d)
+
+        if not channels_d:
+            st.error("No channels detected. Filenames must contain 'Acel_1', 'Acel_2', or 'Acel_3'.")
+        else:
+            # f0 choices: detected FFT peaks of every sensor
+            peak_freqs = sorted({
+                round(float(np.array(ch["frq"])[i]), 2)
+                for ch in channels_d for i in _peaks(ch["frq"], ch["amp"], n_peaks)
+            })
+            f0_default = _dominant_f0(channels_d)
+            nearest    = int(np.argmin([abs(f - f0_default) for f in peak_freqs]))
+
+            c1, c2, c3, c4 = st.columns(4)
+            f0_choice = c1.selectbox(
+                "f₀ (Hz) — FFT peaks", peak_freqs + ["Custom…"], index=nearest,
+                format_func=lambda f: f if isinstance(f, str) else f"{f:.2f}",
+                key="damp_f0_choice",
+            )
+            if f0_choice == "Custom…":
+                f0_d = c1.number_input("Custom f₀ (Hz)", 0.1, channels_d[0]["fs"] / 2,
+                                       round(f0_default, 2), 0.01, format="%.2f",
+                                       key="damp_f0_custom")
+            else:
+                f0_d = float(f0_choice)
+            band_d = c2.number_input("Band ± (Hz)", 0.1, 5.0, 0.5, 0.1, key="damp_band")
+            win_d  = c3.number_input("Decay window (s)", 1.0, 30.0, 5.0, 0.5, key="damp_win")
+            nev_d  = int(c4.number_input("Events / sensor", 1, 10, 3, key="damp_nev"))
+
+            if band_d >= f0_d:
+                st.error("Band must be smaller than f₀.")
+            else:
+                rows_d = run_damping(file_data_d, f0_d, band_d, win_d, nev_d)
+
+                if not rows_d:
+                    st.warning("No decays found — try another f₀ or a wider band.")
+                else:
+                    st.markdown("#### Damping per Event")
+                    st.caption("Untick **Used** to exclude a weak fit (low R²) from the means.")
+                    df_d = pd.DataFrame([{
+                        "Channel":         r["label"].upper(),
+                        "Event t (s)":     round(r["t0"], 1),
+                        "Units":           r["unit"],
+                        "Slope m (1/s)":   round(r["slope"], 4),
+                        "f₀ (Hz)":         round(f0_d, 2),
+                        "Damping ratio %": round(r["zeta"], 3),
+                        "R²":              round(r["r2"], 2),
+                        "Used":            True,
+                    } for r in rows_d])
+                    # key tied to the inputs so exclusions reset when they change
+                    editor_key = (f"damp_editor_{hash(tuple(n for n, _ in file_data_d))}"
+                                  f"_{f0_d}_{band_d}_{win_d}_{nev_d}")
+                    df_d = st.data_editor(
+                        df_d, hide_index=True, use_container_width=True,
+                        disabled=[c for c in df_d.columns if c != "Used"],
+                        key=editor_key,
+                    )
+
+                    # per-accelerometer means (a1, a2, a3) and overall mean
+                    used   = df_d["Used"].to_numpy()
+                    zetas  = np.array([r["zeta"] for r in rows_d])
+                    s_idxs = np.array([r["s_idx"] for r in rows_d])
+                    cols_m = st.columns(len(channels_d) + 1)
+                    for s_idx, (col, ch) in enumerate(zip(cols_m, channels_d)):
+                        z = zetas[used & (s_idxs == s_idx)]
+                        col.metric(f"a{s_idx + 1} ({ch['label'].upper()})",
+                                   f"{z.mean():.3f} %" if len(z) else "—")
+                    cols_m[-1].metric("Promedio",
+                                      f"{zetas[used].mean():.3f} %" if used.any() else "—")
+
+                    st.download_button(
+                        "⬇️ Download table (CSV)",
+                        df_d.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"damping_{f0_d:.2f}Hz.csv", mime="text/csv",
+                    )
+
+                    # plots for one event: filtered signal + envelope, regression
+                    st.markdown("#### Envelope Fit")
+                    best = int(np.argmax([r["r2"] for r in rows_d]))
+                    k = st.selectbox(
+                        "Event", range(len(rows_d)), index=best,
+                        format_func=lambda i: (
+                            f"{rows_d[i]['label'].upper()} · t = {rows_d[i]['t0']:.1f} s · "
+                            f"ζ = {rows_d[i]['zeta']:.3f} % · R² = {rows_d[i]['r2']:.2f}"),
+                        key="damp_event",
+                    )
+                    ev    = rows_d[k]
+                    color = SENSOR_COLORS[ev["s_idx"] % len(SENSOR_COLORS)]
+                    fig_d = make_subplots(
+                        rows=1, cols=2, horizontal_spacing=0.08,
+                        subplot_titles=[
+                            f"{ev['label'].upper()} — filtered around {f0_d:.2f} Hz",
+                            f"Linear regression of envelope — ζ = {ev['zeta']:.3f} %",
+                        ],
+                    )
+                    fig_d.add_trace(go.Scatter(
+                        x=ev["t_seg"], y=ev["y_seg"], mode="lines",
+                        line=dict(color=color, width=1.0),
+                        name=f"filtered {f0_d:.2f} ± {band_d:g} Hz",
+                    ), row=1, col=1)
+                    fig_d.add_trace(go.Scatter(
+                        x=ev["t_mx"], y=ev["a_mx"], mode="lines",
+                        line=dict(color="#ef4444", width=2),
+                        name="envelope of maxima",
+                    ), row=1, col=1)
+                    fig_d.add_trace(go.Scatter(
+                        x=ev["t_mx"], y=np.log(ev["a_mx"]), mode="markers",
+                        marker=dict(symbol="triangle-up-open", color="#ef4444", size=9),
+                        name="ln(envelope)",
+                    ), row=1, col=2)
+                    fig_d.add_trace(go.Scatter(
+                        x=ev["t_mx"], y=ev["slope"] * ev["t_mx"] + ev["icpt"],
+                        mode="lines", line=dict(color="#60a5fa", width=1.5),
+                        name=f"fit: m = {ev['slope']:.4f} 1/s, R² = {ev['r2']:.2f}",
+                    ), row=1, col=2)
+                    fig_d.update_xaxes(title_text="Time (s)")
+                    fig_d.update_yaxes(title_text=f"Acc ({ev['unit']})", row=1, col=1)
+                    fig_d.update_yaxes(title_text="ln(amplitude)",       row=1, col=2)
+                    fig_d.update_layout(legend=dict(
+                        orientation="h", yanchor="bottom", y=-0.3,
+                        xanchor="left", x=0,
+                    ))
+                    st.plotly_chart(_style(fig_d, 480), use_container_width=True)
