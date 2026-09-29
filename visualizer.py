@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks, welch, butter, sosfiltfilt, hilbert
+from scipy.signal import windows, find_peaks, butter, sosfiltfilt, hilbert
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -33,13 +33,11 @@ FG_MAIN  = "#e0e0f0"
 FG_DIM   = "#a0a0b0"
 GRID_COL = "#2a2a4e"
 
-# damping: Welch PSD segment length (4096 @ 250 Hz ≈ 16 s, 0.06 Hz bins) and
-# how far (Hz) from an FFT peak to look for the matching PSD peak
-DAMP_NPERSEG   = 4096
-DAMP_SEARCH_HZ = 0.25
 # decay method: an event must peak at least this many times the median
 # envelope (ambient level) to count as an excitation
 DAMP_MIN_EXCITATION = 8.0
+# default decay-method parameters (Damping window, peak tables, reports)
+DAMP_DEFAULTS = dict(band=0.5, win_s=5.0, n_events=3)
 
 
 # ── data helpers ──────────────────────────────────────────────────────────────
@@ -106,9 +104,7 @@ def load_test_folder(test_folder):
         meta, df = parse_channel_folder(os.path.join(test_folder, d))
         fs       = float(meta.get("Sampling rate", "250") or "250")
         frq, amp = compute_fft(df["value"].to_numpy(), fs)
-        psd_f, psd_p = compute_psd(df["value"].to_numpy(), fs)
-        channels.append(dict(label=d, meta=meta, df=df, frq=frq, amp=amp, pidx=None,
-                             psd_f=psd_f, psd_p=psd_p))
+        channels.append(dict(label=d, meta=meta, df=df, frq=frq, amp=amp, pidx=None))
     return channels
 
 
@@ -128,46 +124,16 @@ def top_peaks(freqs, amp, n=6):
     return np.sort(idx)
 
 
-def compute_psd(values, fs):
-    nseg = min(DAMP_NPERSEG, len(values))
-    return welch(values - values.mean(), fs, window="hann",
-                 nperseg=nseg, noverlap=nseg // 2)
-
-
-def damping_ratio(psd_f, psd_p, f0):
-    """Half-power bandwidth damping ratio (%) of the PSD peak nearest f0.
-
-    Returns None when the peak can't be resolved (band runs off the search
-    range or is narrower than 2 PSD bins)."""
-    band = half_power_band(psd_f, psd_p, f0)
-    if band is None:
-        return None
-    _, f1, f2 = band
-    return 100.0 * (f2 - f1) / (2.0 * f0)
-
-
-def half_power_band(psd_f, psd_p, f0):
-    """(PSD peak index, f1, f2) of the half-power band around f0, or None."""
-    lo, hi = np.searchsorted(psd_f, [f0 - DAMP_SEARCH_HZ, f0 + DAMP_SEARCH_HZ])
-    if hi <= lo or len(psd_f) < 2:
-        return None
-    i  = lo + int(np.argmax(psd_p[lo:hi]))
-    hp = psd_p[i] / 2                     # half power
-    if hp <= 0:
-        return None
-    l = i
-    while l > 0 and psd_p[l] > hp:
-        l -= 1
-    r = i
-    while r < len(psd_p) - 1 and psd_p[r] > hp:
-        r += 1
-    if psd_p[l] > hp or psd_p[r] > hp:
-        return None
-    f1 = np.interp(hp, [psd_p[l], psd_p[l + 1]], [psd_f[l], psd_f[l + 1]])
-    f2 = np.interp(hp, [psd_p[r], psd_p[r - 1]], [psd_f[r], psd_f[r - 1]])
-    if f2 - f1 < 2 * (psd_f[1] - psd_f[0]):
-        return None
-    return i, f1, f2
+def decay_zeta(ch, f0):
+    """Mean decay-method zeta (%) of a channel at f0 with DAMP_DEFAULTS, or
+    None if no decay was found.  Cached on the channel (~60 ms per call)."""
+    cache = ch.setdefault("zeta_cache", {})
+    key = round(float(f0), 4)
+    if key not in cache:
+        fs  = float(ch["meta"].get("Sampling rate", "250") or "250")
+        evs = decay_damping(ch["df"]["value"].to_numpy(), fs, key, **DAMP_DEFAULTS)
+        cache[key] = float(np.mean([e["zeta"] for e in evs])) if evs else None
+    return cache[key]
 
 
 def peak_zeta(ch, rank):
@@ -175,7 +141,7 @@ def peak_zeta(ch, rank):
     pidx = ch["pidx"] if ch["pidx"] is not None else []
     if rank >= len(pidx):
         return "—"
-    z = damping_ratio(ch["psd_f"], ch["psd_p"], ch["frq"][pidx[rank]])
+    z = decay_zeta(ch, ch["frq"][pidx[rank]])
     return f"{z:.2f} %" if z is not None else "—"
 
 
@@ -222,9 +188,6 @@ def decay_damping(values, fs, f0, band=0.5, win_s=5.0, n_events=3):
             t_mx=t_mx, a_mx=seg[mx], include=True,
         ))
     return events
-
-
-DAMP_DEFAULTS = dict(band=0.5, win_s=5.0, n_events=3)
 
 
 def dominant_f0(channels):

@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks, welch, butter, sosfiltfilt, hilbert
+from scipy.signal import windows, find_peaks, butter, sosfiltfilt, hilbert
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -13,10 +13,7 @@ MAX_TIME_PTS  = 6000
 BG            = "#12121c"
 PLOT_BG       = "#1a1a2e"
 GRID_COL      = "rgba(60,60,100,0.5)"
-# damping: Welch PSD segment length (4096 @ 250 Hz ≈ 16 s, 0.06 Hz bins) and
-# how far (Hz) from an FFT peak to look for the matching PSD peak
-DAMP_NPERSEG   = 4096
-DAMP_SEARCH_HZ = 0.25
+MAX_PEAKS     = 15      # upper limit of the "Peaks to detect" slider
 # decay method: an event must peak at least this many times the median
 # envelope (ambient level) to count as an excitation
 DAMP_MIN_EXCITATION = 8.0
@@ -102,9 +99,13 @@ def process_test(file_data):
         sig    = (vals - vals.mean()) * win
         amp    = (2.0 / win.sum()) * np.abs(np.fft.rfft(sig))
         frq    = np.fft.rfftfreq(n, d=1.0 / fs)
-        nseg   = min(DAMP_NPERSEG, n)
-        psd_f, psd_p = welch(vals - vals.mean(), fs, window="hann",
-                             nperseg=nseg, noverlap=nseg // 2)
+        # decay-method zeta for every peak the slider can show (~60 ms each),
+        # computed once here so the peak tables are just lookups
+        peak_zeta = {}
+        for idx in _peaks(frq, amp, MAX_PEAKS):
+            evs = _decay_damping(vals, fs, float(frq[idx]))
+            peak_zeta[int(idx)] = (float(np.mean([e["zeta"] for e in evs]))
+                                   if evs else None)
 
         channels.append(dict(
             label    = label,
@@ -116,8 +117,7 @@ def process_test(file_data):
             values   = vals.tolist(),
             frq      = frq.tolist(),
             amp      = amp.tolist(),
-            psd_f    = psd_f.tolist(),
-            psd_p    = psd_p.tolist(),
+            peak_zeta= peak_zeta,
         ))
 
     return channels
@@ -131,34 +131,6 @@ def _peaks(frq, amp, n):
     return np.sort(idx)
 
 
-def _damping(psd_f, psd_p, f0):
-    """Half-power bandwidth damping ratio (%) of the PSD peak nearest f0.
-
-    Returns None when the peak can't be resolved (band runs off the search
-    range or is narrower than 2 PSD bins)."""
-    psd_f, psd_p = np.array(psd_f), np.array(psd_p)
-    lo, hi = np.searchsorted(psd_f, [f0 - DAMP_SEARCH_HZ, f0 + DAMP_SEARCH_HZ])
-    if hi <= lo or len(psd_f) < 2:
-        return None
-    i  = lo + int(np.argmax(psd_p[lo:hi]))
-    hp = psd_p[i] / 2                     # half power
-    if hp <= 0:
-        return None
-    l = i
-    while l > 0 and psd_p[l] > hp:
-        l -= 1
-    r = i
-    while r < len(psd_p) - 1 and psd_p[r] > hp:
-        r += 1
-    if psd_p[l] > hp or psd_p[r] > hp:
-        return None
-    f1 = np.interp(hp, [psd_p[l], psd_p[l + 1]], [psd_f[l], psd_f[l + 1]])
-    f2 = np.interp(hp, [psd_p[r], psd_p[r - 1]], [psd_f[r], psd_f[r - 1]])
-    if f2 - f1 < 2 * (psd_f[1] - psd_f[0]):
-        return None
-    return 100.0 * (f2 - f1) / (2.0 * f0)
-
-
 def _peak_cells(ch, n):
     """[(freq_str, zeta_str), ...] for ranks 0..n-1 of a channel."""
     frq  = np.array(ch["frq"])
@@ -169,7 +141,7 @@ def _peak_cells(ch, n):
             out.append(("—", "—"))
             continue
         f0 = frq[pidx[rank]]
-        z  = _damping(ch["psd_f"], ch["psd_p"], f0)
+        z  = ch["peak_zeta"].get(int(pidx[rank]))
         out.append((f"{f0:.3f} Hz", f"{z:.2f} %" if z is not None else "—"))
     return out
 
@@ -285,7 +257,7 @@ st.title("📈 Accelerometer FFT Visualizer")
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    n_peaks = st.slider("Peaks to detect", 1, 15, 6)
+    n_peaks = st.slider("Peaks to detect", 1, MAX_PEAKS, 6)
     st.markdown("---")
     st.markdown("""
 **How to upload**
@@ -547,7 +519,7 @@ with tab_compare:
                         pidx = _peaks(frq, amp, n_peaks)
                         if rank < len(pidx):
                             freqs.append(frq[pidx[rank]])
-                            z = _damping(ch["psd_f"], ch["psd_p"], frq[pidx[rank]])
+                            z = ch["peak_zeta"].get(int(pidx[rank]))
                             if z is not None:
                                 zetas.append(z)
                 mean_row[sensor_label] = (
