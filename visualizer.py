@@ -3,12 +3,12 @@ import io
 import datetime
 import tkinter as tk
 import mplcursors
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks
+from scipy.signal import windows, find_peaks, welch
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -32,6 +32,11 @@ BG_PANEL = "#2a2a3e"
 FG_MAIN  = "#e0e0f0"
 FG_DIM   = "#a0a0b0"
 GRID_COL = "#2a2a4e"
+
+# damping: Welch PSD segment length (4096 @ 250 Hz ≈ 16 s, 0.06 Hz bins) and
+# how far (Hz) from an FFT peak to look for the matching PSD peak
+DAMP_NPERSEG   = 4096
+DAMP_SEARCH_HZ = 0.25
 
 
 # ── data helpers ──────────────────────────────────────────────────────────────
@@ -98,7 +103,9 @@ def load_test_folder(test_folder):
         meta, df = parse_channel_folder(os.path.join(test_folder, d))
         fs       = float(meta.get("Sampling rate", "250") or "250")
         frq, amp = compute_fft(df["value"].to_numpy(), fs)
-        channels.append(dict(label=d, meta=meta, df=df, frq=frq, amp=amp, pidx=None))
+        psd_f, psd_p = compute_psd(df["value"].to_numpy(), fs)
+        channels.append(dict(label=d, meta=meta, df=df, frq=frq, amp=amp, pidx=None,
+                             psd_f=psd_f, psd_p=psd_p))
     return channels
 
 
@@ -116,6 +123,57 @@ def top_peaks(freqs, amp, n=6):
     idx, _   = find_peaks(amp, prominence=min_prom, distance=5)
     idx      = idx[np.argsort(amp[idx])[::-1]][:n]
     return np.sort(idx)
+
+
+def compute_psd(values, fs):
+    nseg = min(DAMP_NPERSEG, len(values))
+    return welch(values - values.mean(), fs, window="hann",
+                 nperseg=nseg, noverlap=nseg // 2)
+
+
+def damping_ratio(psd_f, psd_p, f0):
+    """Half-power bandwidth damping ratio (%) of the PSD peak nearest f0.
+
+    Returns None when the peak can't be resolved (band runs off the search
+    range or is narrower than 2 PSD bins)."""
+    band = half_power_band(psd_f, psd_p, f0)
+    if band is None:
+        return None
+    _, f1, f2 = band
+    return 100.0 * (f2 - f1) / (2.0 * f0)
+
+
+def half_power_band(psd_f, psd_p, f0):
+    """(PSD peak index, f1, f2) of the half-power band around f0, or None."""
+    lo, hi = np.searchsorted(psd_f, [f0 - DAMP_SEARCH_HZ, f0 + DAMP_SEARCH_HZ])
+    if hi <= lo or len(psd_f) < 2:
+        return None
+    i  = lo + int(np.argmax(psd_p[lo:hi]))
+    hp = psd_p[i] / 2                     # half power
+    if hp <= 0:
+        return None
+    l = i
+    while l > 0 and psd_p[l] > hp:
+        l -= 1
+    r = i
+    while r < len(psd_p) - 1 and psd_p[r] > hp:
+        r += 1
+    if psd_p[l] > hp or psd_p[r] > hp:
+        return None
+    f1 = np.interp(hp, [psd_p[l], psd_p[l + 1]], [psd_f[l], psd_f[l + 1]])
+    f2 = np.interp(hp, [psd_p[r], psd_p[r - 1]], [psd_f[r], psd_f[r - 1]])
+    if f2 - f1 < 2 * (psd_f[1] - psd_f[0]):
+        return None
+    return i, f1, f2
+
+
+def peak_zeta(ch, rank):
+    """Damping string for the rank-th detected peak of a channel."""
+    pidx = ch["pidx"] if ch["pidx"] is not None else []
+    if rank >= len(pidx):
+        return "—"
+    z = damping_ratio(ch["psd_f"], ch["psd_p"], ch["frq"][pidx[rank]])
+    return f"{z:.2f} %" if z is not None else "—"
 
 
 def style_ax(ax):
@@ -203,6 +261,13 @@ class App(tk.Tk):
                   command=self._generate_report,
                   bg="#065f46", fg="white", relief="flat", padx=10, pady=4,
                   font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left", padx=(10, 0))
+
+        # shared: damping window button on every bar
+        for bar in (self.single_bar, self.compare_bar, self.overlay_bar):
+            tk.Button(bar, text="〰 Damping",
+                      command=self._show_damping,
+                      bg="#9a3412", fg="white", relief="flat", padx=10, pady=4,
+                      font=("Segoe UI", 9, "bold"), cursor="hand2").pack(side="left", padx=(6, 0))
 
         # shared: peaks spinbox on the right of whichever bar is active
         for bar in (self.single_bar, self.compare_bar, self.overlay_bar):
@@ -611,7 +676,9 @@ class App(tk.Tk):
                           loc="upper right", framealpha=0.9)
 
         # peak table below the plot
-        col_labels = ["Rank"] + [ch["label"].upper() for ch in channels[:3]]
+        col_labels = ["Rank"]
+        for ch in channels[:3]:
+            col_labels += [ch["label"].upper(), f"{ch['label'].upper()} ζ"]
         rows = []
         for rank in range(n_peaks):
             row = [f"f{rank+1}"]
@@ -619,6 +686,7 @@ class App(tk.Tk):
                 pidx = ch["pidx"] if ch["pidx"] is not None else []
                 row.append(f"{ch['frq'][pidx[rank]]:.3f} Hz"
                             if rank < len(pidx) else "—")
+                row.append(peak_zeta(ch, rank))
             rows.append(row)
 
         tbl = self.ax_tbl.table(
@@ -650,6 +718,7 @@ class App(tk.Tk):
         for s_idx in range(n_sens):
             for test in self.tests:
                 col_labels.append(f"{sensors[s_idx].upper()}\n{test['name']}\n(Hz)")
+                col_labels.append("ζ (%)")
 
         def get_hz(t_idx, s_idx, rank):
             if t_idx >= len(self.tests):
@@ -662,12 +731,19 @@ class App(tk.Tk):
                 return "—"
             return f"{chs[s_idx]['frq'][pidx[rank]]:.3f}"
 
+        def get_zeta(t_idx, s_idx, rank):
+            chs = self.tests[t_idx]["channels"]
+            if s_idx >= len(chs):
+                return "—"
+            return peak_zeta(chs[s_idx], rank).replace(" %", "")
+
         rows = []
         for rank in range(n_peaks):
             row = [f"f{rank+1}"]
             for s_idx in range(n_sens):
                 for t_idx in range(n_tests):
                     row.append(get_hz(t_idx, s_idx, rank))
+                    row.append(get_zeta(t_idx, s_idx, rank))
             rows.append(row)
 
         tbl = ax.table(cellText=rows, colLabels=col_labels,
@@ -681,7 +757,7 @@ class App(tk.Tk):
             if j == 0:
                 fc, tc = "#e0e0e0", "#333333"
             else:
-                t_idx  = (j - 1) % n_tests
+                t_idx  = (j - 1) // 2 % n_tests
                 st     = TEST_STYLES[t_idx % len(TEST_STYLES)]
                 fc, tc = st["color"], "white"
             cell.set_facecolor(fc)
@@ -692,13 +768,118 @@ class App(tk.Tk):
             for j in range(n_cols):
                 cell = tbl[r + 1, j]
                 cell.set_facecolor("#f7f7f7" if r % 2 == 0 else "white")
-                tc = "#444444" if j == 0 else TEST_STYLES[(j-1) % n_tests % len(TEST_STYLES)]["color"]
+                tc = "#444444" if j == 0 else TEST_STYLES[(j-1) // 2 % n_tests % len(TEST_STYLES)]["color"]
                 cell.set_text_props(color=tc)
                 cell.set_edgecolor("#cccccc")
 
-        ax.set_title("Natural Frequency Comparison — all tests  (Hz, ranked by amplitude)",
+        ax.set_title("Natural Frequency & Damping Comparison — all tests  (Hz / ζ %, ranked by amplitude)",
                      color="#111111", fontsize=9, pad=4)
 
+
+    # ── damping window ────────────────────────────────────────────────────────
+    def _show_damping(self):
+        """Open a window listing ζ for every detected peak of the loaded
+        test(s); selecting a row plots its PSD with the half-power band."""
+        mode = self.mode.get()
+        if mode == "single":
+            tests = [self.single_test] if self.single_test else []
+        elif mode == "overlay":
+            tests = [self.overlay_test] if self.overlay_test else []
+        else:
+            tests = self.tests
+        if not tests:
+            messagebox.showinfo("Damping", "Load a test first.")
+            return
+
+        n = self.n_peaks_var.get()
+        entries = []   # (test name, sensor index, channel, rank, f0, band)
+        for test in tests:
+            for s_idx, ch in enumerate(test["channels"]):
+                ch["pidx"] = top_peaks(ch["frq"], ch["amp"], n)
+                for rank, idx in enumerate(ch["pidx"]):
+                    f0   = ch["frq"][idx]
+                    band = half_power_band(ch["psd_f"], ch["psd_p"], f0)
+                    entries.append((test["name"], s_idx, ch, rank, f0, band))
+
+        win = tk.Toplevel(self)
+        win.title("Damping — half-power bandwidth")
+        win.geometry("1000x780")
+        win.configure(bg=BG_DARK)
+
+        tk.Label(win, bg=BG_DARK, fg=FG_DIM, font=("Segoe UI", 9), justify="left",
+                 anchor="w", wraplength=960,
+                 text=("ζ = (f₂ − f₁) / (2·f₀), where f₁, f₂ are the half-power points of "
+                       f"a Welch PSD (Hann, {DAMP_NPERSEG}-sample segments). "
+                       "Values above ~8 % usually mean two close modes merged into one "
+                       "wide peak.  Select a row to see its band.")
+                 ).pack(fill="x", padx=10, pady=(8, 4))
+
+        cols = ("test", "sensor", "peak", "f0", "zeta", "f1", "f2", "bw")
+        heads = ("Test", "Sensor", "Peak", "f₀ (Hz)", "ζ (%)", "f₁ (Hz)", "f₂ (Hz)", "Δf (Hz)")
+        tree_frame = tk.Frame(win, bg=BG_DARK)
+        tree_frame.pack(fill="both", expand=False, padx=10)
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=12)
+        for c, h in zip(cols, heads):
+            tree.heading(c, text=h)
+            tree.column(c, width=110, anchor="center")
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        for k, (tname, s_idx, ch, rank, f0, band) in enumerate(entries):
+            if band is None:
+                vals = ("—", "—", "—", "—")
+            else:
+                _, f1, f2 = band
+                vals = (f"{100 * (f2 - f1) / (2 * f0):.2f}",
+                        f"{f1:.3f}", f"{f2:.3f}", f"{f2 - f1:.3f}")
+            tree.insert("", "end", iid=str(k),
+                        values=(tname, ch["label"].upper(), f"f{rank + 1}",
+                                f"{f0:.3f}") + vals)
+
+        fig = plt.figure(figsize=(9, 3.6), facecolor="white")
+        ax  = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=8)
+        win.protocol("WM_DELETE_WINDOW", lambda: (plt.close(fig), win.destroy()))
+
+        def on_select(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            tname, s_idx, ch, rank, f0, band = entries[int(sel[0])]
+            color = SENSOR_COLORS[s_idx % len(SENSOR_COLORS)]
+            psd_f, psd_p = ch["psd_f"], ch["psd_p"]
+            m = (psd_f >= f0 - 2) & (psd_f <= f0 + 2)
+            ax.clear(); style_ax(ax)
+            ax.plot(psd_f[m], psd_p[m], color=color, linewidth=1.2)
+            ax.axvline(f0, color="#444444", linewidth=0.8, linestyle=":",
+                       label=f"FFT peak f₀ = {f0:.3f} Hz")
+            if band is not None:
+                i, f1, f2 = band
+                zeta = 100 * (f2 - f1) / (2 * f0)
+                ax.axhline(psd_p[i] / 2, color="#9a3412", linewidth=0.8,
+                           linestyle="--", label="half power")
+                ax.axvspan(f1, f2, color="#9a3412", alpha=0.15,
+                           label=f"f₁–f₂ = {f1:.3f}–{f2:.3f} Hz")
+                ax.plot(psd_f[i], psd_p[i], "o", color=color, markersize=5)
+                title = f"ζ = {zeta:.2f} %"
+            else:
+                title = "ζ not resolvable (band too narrow or runs off the search range)"
+            unit = ch["meta"].get("Unit for accelerometer", "g")
+            ax.set_title(f"{tname} · {ch['label'].upper()} · f{rank + 1}  —  {title}",
+                         color="#111111", fontsize=10, fontweight="bold")
+            ax.set_xlabel("Frequency (Hz)", color="#444444", fontsize=8)
+            ax.set_ylabel(f"PSD ({unit}²/Hz)", color="#444444", fontsize=8)
+            ax.legend(fontsize=8, loc="upper right")
+            fig.tight_layout()
+            canvas.draw()
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+        if entries:
+            tree.selection_set("0")
+            on_select()
 
     # ── report generation ─────────────────────────────────────────────────────
     # ── hover tooltips ────────────────────────────────────────────────────────
@@ -819,7 +1000,9 @@ class App(tk.Tk):
     @staticmethod
     def _add_peak_table(doc, channels, n_peaks):
         """Add a peak-frequency table to the document."""
-        col_headers = ["Rank"] + [ch["label"].upper() for ch in channels]
+        col_headers = ["Rank"]
+        for ch in channels:
+            col_headers += [ch["label"].upper(), f"{ch['label'].upper()} ζ"]
         table = doc.add_table(rows=1 + n_peaks, cols=len(col_headers))
         table.style = "Table Grid"
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -843,18 +1026,18 @@ class App(tk.Tk):
             shd.set(qn("w:val"),   "clear")
             tcPr.append(shd)
 
-        frq_all = [np.array(ch["frq"]) for ch in channels]
-        amp_all = [np.array(ch["amp"]) for ch in channels]
-        pidx_all = [ch.get("pidx") if ch.get("pidx") is not None else [] for ch in channels]
-
         for rank in range(n_peaks):
             row_cells = table.rows[rank + 1].cells
             row_cells[0].text = f"f{rank + 1}"
             row_cells[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             fill = "e8f4fd" if rank % 2 == 0 else "ffffff"
-            for j, (frq, pidx) in enumerate(zip(frq_all, pidx_all), 1):
-                hz = f"{frq[pidx[rank]]:.3f} Hz" if rank < len(pidx) else "—"
-                row_cells[j].text = hz
+            texts = []
+            for ch in channels:
+                pidx = ch["pidx"] if ch["pidx"] is not None else []
+                texts.append(f"{ch['frq'][pidx[rank]]:.3f} Hz" if rank < len(pidx) else "—")
+                texts.append(peak_zeta(ch, rank))
+            for j, text in enumerate(texts, 1):
+                row_cells[j].text = text
                 row_cells[j].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
                 # alternating row colour
                 from docx.oxml.ns import qn
@@ -1018,7 +1201,9 @@ class App(tk.Tk):
 
             # Peak table for this sensor (one column per test)
             self._heading(doc, f"Peak Frequencies — {sensor.upper()}", level=3)
-            col_headers = ["Rank"] + [t["name"] for t in tests]
+            col_headers = ["Rank"]
+            for t in tests:
+                col_headers += [t["name"], f"{t['name']} ζ"]
             tbl = doc.add_table(rows=1 + n, cols=len(col_headers))
             tbl.style = "Table Grid"
 
@@ -1045,17 +1230,20 @@ class App(tk.Tk):
                 row_cells[0].text = f"f{rank + 1}"
                 row_cells[0].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
                 fill = "e8f4fd" if rank % 2 == 0 else "ffffff"
-                for j, test in enumerate(tests, 1):
+                texts = []
+                for test in tests:
                     if s_idx < len(test["channels"]):
                         ch   = test["channels"][s_idx]
                         frq  = np.array(ch["frq"])
                         pidx = ch["pidx"] if ch["pidx"] is not None else []
-                        hz   = (f"{frq[pidx[rank]]:.3f} Hz"
-                                if rank < len(pidx) else "—")
+                        texts.append(f"{frq[pidx[rank]]:.3f} Hz"
+                                     if rank < len(pidx) else "—")
+                        texts.append(peak_zeta(ch, rank))
                     else:
-                        hz = "—"
+                        texts += ["—", "—"]
+                for j, text in enumerate(texts, 1):
                     cell = row_cells[j]
-                    cell.text = hz
+                    cell.text = text
                     cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
                     tc   = cell._tc
                     tcPr = tc.get_or_add_tcPr()

@@ -33,6 +33,7 @@ The desktop app discovers channels by `acel*` subfolder names. The web app has n
 
 - FFT: subtract mean, apply Hann window, amplitude = `2/sum(window) * |rfft|`.
 - Peaks: `scipy.signal.find_peaks` with prominence ≥ 1% of max amplitude and `distance=5`, keep top N by amplitude, returned sorted by frequency. N is user-selectable.
+- Damping (ζ column in every peak table/report): half-power bandwidth on a Welch PSD (Hann, `nperseg=DAMP_NPERSEG`=4096, 50% overlap), not on the raw FFT — the raw FFT of these long ambient records is too noisy. For each FFT peak, take the PSD max within ±`DAMP_SEARCH_HZ` (0.25 Hz), find where PSD drops to ½, ζ = (f₂−f₁)/(2·f₀). Returns None ("—") if the band is < 2 PSD bins or runs off the spectrum. `compute_psd`/`damping_ratio`/`peak_zeta` in `visualizer.py` vs. PSD in `process_test` + `_damping`/`_peak_cells` in `app.py`.
 
 ## Views
 

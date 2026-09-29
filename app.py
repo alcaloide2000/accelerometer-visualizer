@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.signal import windows, find_peaks
+from scipy.signal import windows, find_peaks, welch
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -13,6 +13,10 @@ MAX_TIME_PTS  = 6000
 BG            = "#12121c"
 PLOT_BG       = "#1a1a2e"
 GRID_COL      = "rgba(60,60,100,0.5)"
+# damping: Welch PSD segment length (4096 @ 250 Hz ≈ 16 s, 0.06 Hz bins) and
+# how far (Hz) from an FFT peak to look for the matching PSD peak
+DAMP_NPERSEG   = 4096
+DAMP_SEARCH_HZ = 0.25
 
 
 # ── data processing ───────────────────────────────────────────────────────────
@@ -95,6 +99,9 @@ def process_test(file_data):
         sig    = (vals - vals.mean()) * win
         amp    = (2.0 / win.sum()) * np.abs(np.fft.rfft(sig))
         frq    = np.fft.rfftfreq(n, d=1.0 / fs)
+        nseg   = min(DAMP_NPERSEG, n)
+        psd_f, psd_p = welch(vals - vals.mean(), fs, window="hann",
+                             nperseg=nseg, noverlap=nseg // 2)
 
         channels.append(dict(
             label    = label,
@@ -106,6 +113,8 @@ def process_test(file_data):
             values   = vals.tolist(),
             frq      = frq.tolist(),
             amp      = amp.tolist(),
+            psd_f    = psd_f.tolist(),
+            psd_p    = psd_p.tolist(),
         ))
 
     return channels
@@ -117,6 +126,49 @@ def _peaks(frq, amp, n):
     idx, _   = find_peaks(amp, prominence=min_prom, distance=5)
     idx      = idx[np.argsort(amp[idx])[::-1]][:n]
     return np.sort(idx)
+
+
+def _damping(psd_f, psd_p, f0):
+    """Half-power bandwidth damping ratio (%) of the PSD peak nearest f0.
+
+    Returns None when the peak can't be resolved (band runs off the search
+    range or is narrower than 2 PSD bins)."""
+    psd_f, psd_p = np.array(psd_f), np.array(psd_p)
+    lo, hi = np.searchsorted(psd_f, [f0 - DAMP_SEARCH_HZ, f0 + DAMP_SEARCH_HZ])
+    if hi <= lo or len(psd_f) < 2:
+        return None
+    i  = lo + int(np.argmax(psd_p[lo:hi]))
+    hp = psd_p[i] / 2                     # half power
+    if hp <= 0:
+        return None
+    l = i
+    while l > 0 and psd_p[l] > hp:
+        l -= 1
+    r = i
+    while r < len(psd_p) - 1 and psd_p[r] > hp:
+        r += 1
+    if psd_p[l] > hp or psd_p[r] > hp:
+        return None
+    f1 = np.interp(hp, [psd_p[l], psd_p[l + 1]], [psd_f[l], psd_f[l + 1]])
+    f2 = np.interp(hp, [psd_p[r], psd_p[r - 1]], [psd_f[r], psd_f[r - 1]])
+    if f2 - f1 < 2 * (psd_f[1] - psd_f[0]):
+        return None
+    return 100.0 * (f2 - f1) / (2.0 * f0)
+
+
+def _peak_cells(ch, n):
+    """[(freq_str, zeta_str), ...] for ranks 0..n-1 of a channel."""
+    frq  = np.array(ch["frq"])
+    pidx = _peaks(frq, ch["amp"], n)
+    out  = []
+    for rank in range(n):
+        if rank >= len(pidx):
+            out.append(("—", "—"))
+            continue
+        f0 = frq[pidx[rank]]
+        z  = _damping(ch["psd_f"], ch["psd_p"], f0)
+        out.append((f"{f0:.3f} Hz", f"{z:.2f} %" if z is not None else "—"))
+    return out
 
 
 def _ds(arr, mx):
@@ -301,16 +353,14 @@ with tab_single:
             st.plotly_chart(_style(fig_ov, 450), use_container_width=True)
 
             # peak table
-            st.markdown("#### Peak Frequencies")
+            st.markdown("#### Peak Frequencies & Damping")
+            cells = [_peak_cells(ch, n_peaks) for ch in channels]
             rows = []
             for rank in range(n_peaks):
                 row = {"Rank": f"f{rank+1}"}
-                for ch in channels:
-                    pidx = _peaks(np.array(ch["frq"]), np.array(ch["amp"]), n_peaks)
-                    row[ch["label"].upper()] = (
-                        f"{np.array(ch['frq'])[pidx[rank]]:.3f} Hz"
-                        if rank < len(pidx) else "—"
-                    )
+                for ch, c in zip(channels, cells):
+                    row[ch["label"].upper()]        = c[rank][0]
+                    row[f"{ch['label'].upper()} ζ"] = c[rank][1]
                 rows.append(row)
             st.dataframe(pd.DataFrame(rows).set_index("Rank"), use_container_width=True)
 
@@ -399,18 +449,16 @@ with tab_compare:
         st.plotly_chart(_style(fig, 480), use_container_width=True)
 
         # peak comparison table
-        st.markdown("#### Peak Frequency Comparison")
+        st.markdown("#### Peak Frequency & Damping Comparison")
+        cells = {id(ch): _peak_cells(ch, n_peaks)
+                 for test in tests for ch in test["channels"]}
         rows = []
         for rank in range(n_peaks):
             row = {"Rank": f"f{rank+1}"}
             for test in tests:
                 for ch in test["channels"]:
-                    frq  = np.array(ch["frq"])
-                    amp  = np.array(ch["amp"])
-                    pidx = _peaks(frq, amp, n_peaks)
                     key  = f"{ch['label'].upper()} — {test['name']}"
-                    row[key] = (f"{frq[pidx[rank]]:.3f} Hz"
-                                if rank < len(pidx) else "—")
+                    row[key], row[f"{key} ζ"] = cells[id(ch)][rank]
             rows.append(row)
         st.dataframe(
             pd.DataFrame(rows).set_index("Rank"),
@@ -418,13 +466,13 @@ with tab_compare:
         )
 
         # ── mean frequency summary per accelerometer ──────────────────────────
-        st.markdown("#### Mean Peak Frequencies per Accelerometer")
+        st.markdown("#### Mean Peak Frequencies & Damping per Accelerometer")
         mean_rows = []
         for rank in range(n_peaks):
             mean_row = {"Rank": f"f{rank+1}"}
             for s_idx in range(n_sens):
                 sensor_label = sensors[s_idx].upper()
-                freqs = []
+                freqs, zetas = [], []
                 for test in tests:
                     if s_idx < len(test["channels"]):
                         ch   = test["channels"][s_idx]
@@ -433,8 +481,14 @@ with tab_compare:
                         pidx = _peaks(frq, amp, n_peaks)
                         if rank < len(pidx):
                             freqs.append(frq[pidx[rank]])
+                            z = _damping(ch["psd_f"], ch["psd_p"], frq[pidx[rank]])
+                            if z is not None:
+                                zetas.append(z)
                 mean_row[sensor_label] = (
                     f"{np.mean(freqs):.3f} Hz" if freqs else "—"
+                )
+                mean_row[f"{sensor_label} ζ"] = (
+                    f"{np.mean(zetas):.2f} %" if zetas else "—"
                 )
             mean_rows.append(mean_row)
         st.dataframe(
@@ -514,17 +568,14 @@ with tab_3accel:
             st.plotly_chart(_style(fig_3a, 520), use_container_width=True)
 
             # peak table
-            st.markdown("#### Peak Frequencies")
+            st.markdown("#### Peak Frequencies & Damping")
+            cells_3a = [_peak_cells(ch, n_peaks) for ch in channels_3a]
             rows_3a = []
             for rank in range(n_peaks):
                 row = {"Rank": f"f{rank+1}"}
-                for ch in channels_3a:
-                    frq  = np.array(ch["frq"])
-                    amp  = np.array(ch["amp"])
-                    pidx = _peaks(frq, amp, n_peaks)
-                    row[ch["label"].upper()] = (
-                        f"{frq[pidx[rank]]:.3f} Hz" if rank < len(pidx) else "—"
-                    )
+                for ch, c in zip(channels_3a, cells_3a):
+                    row[ch["label"].upper()]        = c[rank][0]
+                    row[f"{ch['label'].upper()} ζ"] = c[rank][1]
                 rows_3a.append(row)
             st.dataframe(
                 pd.DataFrame(rows_3a).set_index("Rank"),
@@ -608,18 +659,16 @@ with tab_overlay:
 
         # combined peak table across all loaded tests
         if len(tests_ov) > 1:
-            st.markdown("#### Peak Frequencies — All Tests")
+            st.markdown("#### Peak Frequencies & Damping — All Tests")
+            cells = {id(ch): _peak_cells(ch, n_peaks)
+                     for test in tests_ov for ch in test["channels"]}
             rows = []
             for rank in range(n_peaks):
                 row = {"Rank": f"f{rank+1}"}
                 for test in tests_ov:
                     for ch in test["channels"]:
-                        frq  = np.array(ch["frq"])
-                        amp  = np.array(ch["amp"])
-                        pidx = _peaks(frq, amp, n_peaks)
                         key  = f"{ch['label'].upper()} — {test['name']}"
-                        row[key] = (f"{frq[pidx[rank]]:.3f} Hz"
-                                    if rank < len(pidx) else "—")
+                        row[key], row[f"{key} ζ"] = cells[id(ch)][rank]
                 rows.append(row)
             st.dataframe(
                 pd.DataFrame(rows).set_index("Rank"),
