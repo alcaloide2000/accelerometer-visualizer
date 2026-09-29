@@ -1,0 +1,41 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+Accelerometer FFT visualizer for vibration tests recorded with BeanDevice AX3D sensors (up to 3 accelerometers per test). It computes a Hann-windowed FFT per channel, detects dominant frequency peaks, and compares them across tests/sensors. There are **two independent front-ends that duplicate the same processing logic** — no shared module:
+
+- `visualizer.py` — Tkinter + matplotlib desktop app (with `mplcursors` hover and `.docx` report export via `python-docx`). Reads test folders from disk.
+- `app.py` — Streamlit + Plotly web app, deployed on Render (`render.yaml`). Works from uploaded files, not the filesystem.
+
+When changing parsing, FFT, or peak-detection behavior, update **both** files (`parse_file`/`compute_fft`/`top_peaks` in `visualizer.py` vs. `_parse_bytes`/`process_test`/`_peaks` in `app.py`).
+
+## Commands
+
+```bash
+pip install -r requirements.txt          # web app deps only
+python visualizer.py                     # desktop app (also needs matplotlib, mplcursors, python-docx — not in requirements.txt)
+streamlit run app.py                     # web app locally
+```
+
+No tests, linter, or build step exist. `requirements.txt` is the Render deploy manifest, so don't add desktop-only dependencies to it.
+
+## Data format
+
+A test is a folder (e.g. `test1/`, untracked sample data) containing `acel1/`, `acel2/`, `acel3/` subfolders. Each channel folder has:
+- one main `.txt` file: `key : value` header lines (metadata, incl. `Sampling rate`, default 250 Hz if missing), then a `Timestamp;Measure Value` line, then `timestamp;value` rows;
+- optional `*_part001.txt`, `*_part002.txt`, … files that contain data rows only and are concatenated after the main file in sorted order.
+
+The desktop app discovers channels by `acel*` subfolder names. The web app has no folders, so it groups uploaded files by `Acel_1`/`Acel_2`/`Acel_3` in the filename and detects part files by `_part` in the name. Timestamps are sample indices (time = timestamp / fs).
+
+## Processing (shared semantics)
+
+- FFT: subtract mean, apply Hann window, amplitude = `2/sum(window) * |rfft|`.
+- Peaks: `scipy.signal.find_peaks` with prominence ≥ 1% of max amplitude and `distance=5`, keep top N by amplitude, returned sorted by frequency. N is user-selectable.
+
+## Views
+
+Both apps expose the same analysis modes: **Single Test** (one test, its channels), **Compare Tests** (multiple tests, per-sensor comparison plus peak/mean-frequency tables), and **Compare 3 Accelerometers** (sensors of one test overlaid). `app.py` adds a fourth tab, "Sensors per Test". In `visualizer.py`, the mode is `self.mode` (`single`/`compare`/`overlay`); each has `_load_*`, `_plot_*`, `_rebuild_legend_*` and `_write_*_report` methods, dispatched from `_replot` and `_generate_report`.
+
+In `app.py`, `process_test` is `@st.cache_data`-cached and takes a tuple of `(name, bytes)` so it's hashable; time-domain plots are downsampled to `MAX_TIME_PTS` via `_ds`.
