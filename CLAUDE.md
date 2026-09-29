@@ -19,7 +19,18 @@ python visualizer.py                     # desktop app (also needs matplotlib, m
 streamlit run app.py                     # web app locally
 ```
 
-No tests, linter, or build step exist. `requirements.txt` is the Render deploy manifest, so don't add desktop-only dependencies to it.
+Build a standalone Windows exe of the desktop app (output `dist/AccelerometerVisualizer.exe`, ignored by git):
+
+```bash
+python -m PyInstaller --noconfirm --onefile --windowed --name AccelerometerVisualizer \
+  --hidden-import scipy._cyutility \
+  --exclude-module streamlit --exclude-module plotly --exclude-module IPython \
+  --exclude-module PyQt5 --exclude-module PySide6 visualizer.py
+```
+
+`scipy._cyutility` must be listed explicitly (scipy ≥ 1.16; without it the exe dies on import with `ModuleNotFoundError`).
+
+No tests or linter exist. `requirements.txt` is the Render deploy manifest, so don't add desktop-only dependencies to it.
 
 ## Data format
 
